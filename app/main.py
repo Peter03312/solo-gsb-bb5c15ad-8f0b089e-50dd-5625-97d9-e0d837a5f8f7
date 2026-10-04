@@ -1,0 +1,600 @@
+"""FastAPI 应用：样本交接链核验 HTTP API。"""
+import json
+import math
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from . import config
+from .calibrations import (
+    calibration_view,
+    get_certificate_or_404,
+    get_trusted_temperature_review,
+    list_calibrations,
+    register_calibration,
+    void_calibration,
+)
+from .db import db_session, init_db, row_to_dict
+from .dispositions import list_anomaly_view, list_disposition_ledger, submit_disposition
+from .dossiers import get_dossier, submit_dossier, verify_dossier
+from .identities import add_alias, get_person, list_persons, register_person
+from .reconciliations import get_batch_reconciliation, submit_batch_reconciliation
+from .reviews import get_review, submit_review
+from .schemas import (
+    AliasIn,
+    AnomalyDispositionIn,
+    ApproveIn,
+    BatchReconciliationIn,
+    CorrectionIn,
+    DossierIn,
+    EventIn,
+    PersonIn,
+    ReviewIn,
+    SampleIn,
+    TempConfigIn,
+    TempReadingIn,
+    CalibrationIn,
+    CalibrationVoidIn,
+    TransferBatchIn,
+)
+from .service import (
+    DomainError,
+    approve_storage,
+    create_event,
+    evaluate,
+    evaluation_summary,
+    get_sample_or_404,
+    get_transfer_batch,
+    list_corrections,
+    register_sample,
+    submit_correction,
+    submit_transfer_batch,
+)
+from .temperature import create_temp_reading, get_temperature_review, set_temp_config
+from .versions import get_version, latest_version_no, list_versions, parse_version
+
+API_PREFIX = "/api/v1"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动升级：建表、旧库补列、索引与版本 0 基线作为一次原子事务执行。
+    # 任一步失败整体回滚并在此抛出 → 应用启动失败，进程不对外服务；
+    # 修复原因后重启即可从头重试（升级可恢复，各步骤幂等）。
+    init_db()
+    if config.SEED_ON_START:
+        # 仅当库中尚无样本时写入演示数据，重启不重复
+        from .seed import seed_demo
+
+        with db_session() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM sample").fetchone()[0]
+        if count == 0:
+            seed_demo()
+    yield
+
+
+app = FastAPI(
+    title="样本交接链核验服务",
+    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核、人员标识复核回避、运输测温证据复核与设备校准可信复核",
+    version="1.11.0",
+    lifespan=lifespan,
+)
+
+
+@app.exception_handler(DomainError)
+async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}})
+
+
+def _sanitize_non_finite(obj: Any) -> Any:
+    """校验错误明细中的非有限浮点（NaN/Infinity）转为字符串，保证 422 响应可序列化。"""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return repr(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_non_finite(v) for v in obj]
+    return obj
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # 与 FastAPI 默认形态一致（{"detail": [...]}），仅净化非有限浮点输入值
+    return JSONResponse(status_code=422, content={"detail": _sanitize_non_finite(jsonable_encoder(exc.errors()))})
+
+
+def _summary(result: dict[str, Any], sample: dict[str, Any], conn=None) -> dict[str, Any]:
+    body = evaluation_summary(result, sample)
+    if conn is not None:
+        # 当前最新版本号（版本 0 起；便于质控复核定位）
+        body["current_version"] = latest_version_no(conn, sample["id"])
+    return body
+
+
+# --------------------------------------------------------------------------- 基本信息
+
+@app.get("/", tags=["meta"])
+def root() -> dict[str, Any]:
+    return {
+        "service": "样本交接链核验服务",
+        "docs": "/docs",
+        "health": "/health",
+        "api_prefix": API_PREFIX,
+        "status_values": {"valid": "有效", "pending": "待补证", "invalid": "无效"},
+    }
+
+
+@app.get("/health", tags=["meta"])
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------- 样本登记
+
+@app.post(f"{API_PREFIX}/samples", tags=["samples"], status_code=201)
+def register_sample_api(data: SampleIn) -> JSONResponse:
+    with db_session(immediate=True) as conn:
+        sample, idempotent = register_sample(conn, data)
+        result = evaluate(conn, sample)
+        body = {
+            "sample": {k: sample[k] for k in ("sample_code", "collected_at", "collector", "seal_no", "created_at")},
+            "evaluation": _summary(result, dict(sample), conn),
+            "idempotent": idempotent,
+        }
+    return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+@app.get(f"{API_PREFIX}/samples", tags=["samples"])
+def list_samples_api() -> dict[str, Any]:
+    with db_session() as conn:
+        samples = conn.execute("SELECT * FROM sample ORDER BY id").fetchall()
+        items = [_summary(evaluate(conn, s), dict(s), conn) for s in samples]
+    return {"total": len(items), "items": items}
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}", tags=["samples"])
+def get_sample_api(sample_code: str) -> dict[str, Any]:
+    with db_session() as conn:
+        sample = get_sample_or_404(conn, sample_code)
+        result = evaluate(conn, sample)
+        return {"sample": row_to_dict(sample), "evaluation": _summary(result, dict(sample), conn)}
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/chain", tags=["samples"])
+def get_chain_api(sample_code: str) -> dict[str, Any]:
+    """完整证据链：按时间排列的事件、当前保管人、结论与原因。"""
+    with db_session() as conn:
+        sample = get_sample_or_404(conn, sample_code)
+        result = evaluate(conn, sample)
+        return {
+            "sample": {k: sample[k] for k in ("sample_code", "collected_at", "collector", "seal_no")},
+            "status": result["status"],
+            "reasons": result["reasons"],
+            "current_custodian": result["current_custodian"],
+            "pending_transfer": result["pending_transfer"],
+            "has_storage": result["has_storage"],
+            "approved_storage_at": sample["approved_storage_at"],
+            "timeline": result["timeline"],
+            "corrections": result["corrections"],
+            "superseded_events": result["superseded_events"],
+            "current_version": latest_version_no(conn, sample["id"]),
+        }
+
+
+# --------------------------------------------------------------------------- 保管链版本复核
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/versions", tags=["versions"])
+def list_versions_api(sample_code: str) -> dict[str, Any]:
+    """版本索引：列出该样本全部版本（版本号、提交时间、触发类型、当时结论）。
+
+    版本按提交先后排列；核定后旧版仍可查询。
+    """
+    with db_session() as conn:
+        return list_versions(conn, sample_code)
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/versions/latest", tags=["versions"])
+def get_latest_version_api(sample_code: str) -> dict[str, Any]:
+    """当前最新版本的完整保管链快照（便捷端点，等价于按 current_version 取版本）。"""
+    with db_session() as conn:
+        sample = get_sample_or_404(conn, sample_code)
+        version = latest_version_no(conn, sample["id"])
+        return {"version_snapshot": get_version(conn, sample_code, version)}
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/versions/{{version_raw}}", tags=["versions"])
+def get_version_api(sample_code: str, version_raw: str) -> dict[str, Any]:
+    """指定版本复核：返回该版本提交时点的核验结论、原因、当前保管人、
+    有效事件时间线、纠错记录与核定信息（不可变快照）。
+
+    未知样本 → 404 sample_not_found；不存在的版本 → 404 version_not_found。
+    """
+    version = parse_version(version_raw)
+    with db_session() as conn:
+        return {"version_snapshot": get_version(conn, sample_code, version)}
+
+
+# --------------------------------------------------------------------------- 事件上报
+
+@app.post(f"{API_PREFIX}/events", tags=["events"], status_code=201)
+def create_event_api(data: EventIn) -> JSONResponse:
+    """移交 / 签收 / 封签检查 / 入库 统一上报入口。
+
+    同 event_id 同内容重试 → 200 幂等返回；同 event_id 异内容 → 409 冲突。
+    """
+    with db_session(immediate=True) as conn:
+        row, idempotent = create_event(conn, data)
+        sample = conn.execute("SELECT * FROM sample WHERE id = ?", (row["sample_id"],)).fetchone()
+        result = evaluate(conn, sample)
+        body = {
+            "event": {
+                "event_id": row["event_id"],
+                "event_type": row["event_type"],
+                "sample_code": data.sample_code,
+                "occurred_at": row["occurred_at"],
+                "payload": json.loads(row["payload_json"]),
+                "recorded_at": row["created_at"],
+            },
+            "evaluation": _summary(result, dict(sample), conn),
+            "idempotent": idempotent,
+        }
+    return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+# --------------------------------------------------------------------------- 批量移交（同一交接车次多份样本）
+
+@app.post(f"{API_PREFIX}/transfer-batches", tags=["transfer-batches"], status_code=201)
+def submit_transfer_batch_api(data: TransferBatchIn) -> JSONResponse:
+    """同一交接车次多份样本一次提交，各份作为既有 transfer 事件原子写入。
+
+    * 整批失败不留痕：批内样本/事件号重复、样本不存在/已核定、任一事件号已占用
+      → 事务回滚，不创建批次与任何事件（409/422 batch_rejected，逐项给出）；
+    * 同批次号同内容重试 → 200 幂等（样本此后已核定也成立）；异内容 → 409 batch_conflict；
+    * 并发提交由 BEGIN IMMEDIATE 串行化，按已提交顺序判定。
+    """
+    with db_session(immediate=True) as conn:
+        batch, idempotent = submit_transfer_batch(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"batch": batch, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/transfer-batches/{{batch_id}}", tags=["transfer-batches"])
+def get_transfer_batch_api(batch_id: str) -> dict[str, Any]:
+    """批次查询：逐份样本的当前核验结论及原事件是否仍有效（纠错后反映有效链）。"""
+    with db_session() as conn:
+        return {"batch": get_transfer_batch(conn, batch_id)}
+
+
+# --------------------------------------------------------------------------- 整批对账签收（批量移交到达接收方）
+
+@app.post(f"{API_PREFIX}/transfer-batches/{{batch_id}}/reconciliation", tags=["reconciliations"], status_code=201)
+def submit_batch_reconciliation_api(batch_id: str, data: BatchReconciliationIn) -> JSONResponse:
+    """同一批次到达接收方后的整批对账签收：逐份清单覆盖原批次全部样本。
+
+    * 收妥项（event_id + verified_seal_no）：须对应仍有效且处于该笔移交在途状态的事件，
+      签收人/封签/时间满足既有单份签收规则；成功时作为既有 receive 事件与各样本新版本同事务提交；
+    * 异常项（reason）：仅留对账记录、不生成签收事件；
+    * 批次不存在、缺项/重复/外来项、事件号占用、任一收妥项不合格 → 整单拒绝且不留记录
+      （409 reconciliation_rejected=已核定/事件号占用；422=清单不合法/收妥项不合格，逐项给出）；
+    * 同签收单号同内容重试 → 200 幂等返回原结果；异内容（含跨批次）→ 409 reconciliation_conflict；
+    * 一个批次只能成功对账一次：批次已对账再提交 → 409 batch_already_reconciled；
+    * 并发由 BEGIN IMMEDIATE 串行，按已提交状态判定。
+    """
+    with db_session(immediate=True) as conn:
+        reconciliation, idempotent = submit_batch_reconciliation(conn, batch_id, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"reconciliation": reconciliation, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/transfer-batches/{{batch_id}}/reconciliation", tags=["reconciliations"])
+def get_batch_reconciliation_api(batch_id: str) -> dict[str, Any]:
+    """批次对账查询：当时的收妥/异常明细（原样留痕）与各收妥事件纠错后的现时有效性。"""
+    with db_session() as conn:
+        return {"reconciliation": get_batch_reconciliation(conn, batch_id)}
+
+
+# --------------------------------------------------------------------------- 事件纠错
+
+@app.post(f"{API_PREFIX}/corrections", tags=["corrections"], status_code=201)
+def submit_correction_api(data: CorrectionIn) -> JSONResponse:
+    """核定前事件纠错：作废（void）或替换（replace）。
+
+    * 仅核定入库前、且目标为当前有效版本时可提交；不得跨样本；
+    * 同 correction_id 同内容重试 → 200 幂等；异内容 → 409 correction_conflict；
+    * replace 须给完整新事件内容与未占用新事件号；
+    * 并发针对同一有效版本仅一次成功，失败不改变链；
+    * 响应 evaluation 为纠错后仅按有效版本重算的结论/原因/当前保管人。
+    """
+    with db_session(immediate=True) as conn:
+        body, idempotent = submit_correction(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/corrections", tags=["corrections"])
+def list_corrections_api(sample_code: str) -> dict[str, Any]:
+    """样本的纠错审计记录（原事件与纠错关系永久留痕）。"""
+    with db_session() as conn:
+        items = list_corrections(conn, sample_code)
+    return {"sample_code": sample_code, "total": len(items), "items": items}
+
+
+# --------------------------------------------------------------------------- 入库核定
+
+@app.post(f"{API_PREFIX}/samples/{{sample_code}}/approve", tags=["approval"])
+def approve_api(sample_code: str, data: ApproveIn) -> dict[str, Any]:
+    with db_session(immediate=True) as conn:
+        result = approve_storage(conn, sample_code, data)
+        sample = get_sample_or_404(conn, sample_code)
+        return {"evaluation": _summary(result, dict(sample), conn), "approval": result["approval"]}
+
+
+# --------------------------------------------------------------------------- 运输测温证据（未核定样本）
+
+@app.post(f"{API_PREFIX}/temperature-configs", tags=["temperature"], status_code=201)
+def set_temp_config_api(data: TempConfigIn) -> JSONResponse:
+    """一次性设定运输测温配置（允许摄氏温度闭区间 + 正数最大测温间隔）。
+
+    * 每份未核定样本至多设定一次：同内容重试 → 200 幂等，异内容 → 409 temp_config_conflict；
+    * 核定入库后拒绝新配置（409 history_locked），同内容重试仍幂等返回；
+    * 配置不参与保管链核验结论、不产生保管链版本。
+    """
+    with db_session(immediate=True) as conn:
+        config, idempotent = set_temp_config(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"config": config, "idempotent": idempotent})
+
+
+@app.post(f"{API_PREFIX}/temperature-readings", tags=["temperature"], status_code=201)
+def create_temp_reading_api(data: TempReadingIn) -> JSONResponse:
+    """按全局唯一读数号记录测温读数（设备号、发生时间、有限数值）。
+
+    * 须先完成测温配置（否则 409 temp_config_missing）；发生时间早于采集 → 422；
+    * 同一样本同一发生时刻只允许一条读数（重复 → 409 reading_time_duplicate）；
+    * 同读数号同内容重试 → 200 返回原记录；异内容 → 409 reading_conflict；
+    * 核定后拒绝新读数（409 history_locked）；读数不产生保管链版本。
+    """
+    with db_session(immediate=True) as conn:
+        reading, idempotent = create_temp_reading(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"reading": reading, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/temperature", tags=["temperature"])
+def get_temperature_review_api(sample_code: str) -> dict[str, Any]:
+    """测温证据复核：按发生时间列出超温点与缺测区间（跨移交/签收时刻拆分）。
+
+    每段依当前有效保管链标明当时保管人（custodian）或在途移交（in_transit）；
+    断链导致归属不能确定时标为待核（pending_review）；乱序补录与移交/签收纠错后
+    再次查询即按最新有效链重算归属。未设定测温配置 → 404 temp_config_not_found。
+    """
+    with db_session() as conn:
+        return get_temperature_review(conn, sample_code)
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/temperature/trusted", tags=["temperature"])
+def get_trusted_temperature_review_api(sample_code: str) -> dict[str, Any]:
+    """可信测温复核：逐条列出读数匹配的证明号或缺证原因。
+
+    仅使用被未作废证明按左闭右开有效期覆盖的读数计算超温点，以及相邻有证读数间的
+    缺测区间；保管链区间拆分与归属规则与既有测温复核完全一致。没有任何有证读数时
+    `assessment_status=unable_to_assess`，且评估结果为空。补录/作废证明后查询即时重算。
+    """
+    with db_session() as conn:
+        return get_trusted_temperature_review(conn, sample_code)
+
+
+# --------------------------------------------------------------------------- 测温设备校准证明
+
+@app.post(f"{API_PREFIX}/temperature-calibrations", tags=["temperature"], status_code=201)
+def register_calibration_api(data: CalibrationIn) -> JSONResponse:
+    """登记测温设备校准证明（全局唯一证明号、设备号、左闭右开有效期与签发人）。
+
+    * 设备号必须已出现在测温读数中；有效期 valid_from < valid_to；
+    * 同一设备未作废证明有效时段不得重叠（相邻端点允许，已作废证明不参与）；
+    * 同证明号同内容重试 → 200 返回原结果；异内容 → 409 calibration_conflict；
+    * 无效时段 → 422；重叠 → 409 calibration_overlap；失败不留部分记录。
+    """
+    with db_session(immediate=True) as conn:
+        certificate, idempotent = register_calibration(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"certificate": certificate, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/temperature-calibrations", tags=["temperature"])
+def list_calibrations_api(device_id: str | None = None) -> dict[str, Any]:
+    """列出校准证明；可用 ?device_id= 仅查看某台设备（含已作废证明）。"""
+    with db_session() as conn:
+        return list_calibrations(conn, device_id)
+
+
+@app.get(f"{API_PREFIX}/temperature-calibrations/{{certificate_id}}", tags=["temperature"])
+def get_calibration_api(certificate_id: str) -> dict[str, Any]:
+    """按证明号查询校准证明及作废状态；未知证明 → 404 calibration_not_found。"""
+    with db_session() as conn:
+        row = get_certificate_or_404(conn, certificate_id)
+        return {"certificate": calibration_view(row)}
+
+
+@app.post(f"{API_PREFIX}/temperature-calibrations/{{certificate_id}}/void", tags=["temperature"], status_code=201)
+def void_calibration_api(certificate_id: str, data: CalibrationVoidIn) -> JSONResponse:
+    """附理由作废校准证明。
+
+    * 作废后该证明不再覆盖任何读数，可信复核即时重算；
+    * 未知证明 → 404 calibration_not_found；
+    * 同证明号同理由重试 → 200 返回原作废结果；不同理由 → 409 calibration_void_conflict。
+    """
+    with db_session(immediate=True) as conn:
+        certificate, idempotent = void_calibration(conn, certificate_id, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"certificate": certificate, "idempotent": idempotent})
+
+
+# --------------------------------------------------------------------------- 可信测温异常处置（运输质控）
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/temperature/anomalies", tags=["temperature-dispositions"])
+def list_anomalies_api(sample_code: str) -> dict[str, Any]:
+    """按样本查询当前可信测温复核异常项及其处置状态。
+
+    每项返回稳定标识（anomaly_id）、证据摘要（evidence_digest）、时间范围、
+    相关读数及校准证明、依当前有效保管链重算的归属（归属待核时 attribution_pending=true，
+    不臆定责任人），以及处置状态：未处置（disposition_status=pending）、有效处置
+    （active，附有效处置单）、失效历史（invalidated_history，旧意见永久可查）。
+    查询会惰性对账：异常消失或摘要变化的有效处置被标记为失效（只更新处置表状态，
+    不改原始读数、证明、可信复核结论、保管链版本与封存案卷）。未设定测温配置 → 404。
+    """
+    with db_session(immediate=True) as conn:
+        return list_anomaly_view(conn, sample_code)
+
+
+@app.post(
+    f"{API_PREFIX}/samples/{{sample_code}}/temperature/anomalies/dispositions",
+    tags=["temperature-dispositions"], status_code=201,
+)
+def submit_disposition_api(sample_code: str, data: AnomalyDispositionIn) -> JSONResponse:
+    """对一个当前异常项提交处置单（认可 acknowledged / 排除 excluded）。
+
+    * 必须回传所见稳定标识与证据摘要：异常已消失（anomaly_gone）或摘要已变化
+      （evidence_changed）→ 422 anomaly_stale，整单拒绝且不留记录（不占处置单号）；
+    * 同一异常项同一证据摘要只接受一次处置：重复提交 → 409 anomaly_already_disposed；
+    * 同处置单号同内容重试 → 200 幂等返回原结果（即使原意见其后已失效）；
+      异内容（含跨样本复用单号）→ 409 disposition_conflict；
+    * 读数补录、证明补录/作废、保管链纠错使异常或归属变化后，旧意见在对账时标为失效
+      （永久可查），新摘要下可重新处置；本接口不改变原始证据、可信复核、保管链版本及封存案卷。
+    """
+    with db_session(immediate=True) as conn:
+        body, idempotent = submit_disposition(conn, sample_code, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={**body, "idempotent": idempotent})
+
+
+@app.get(
+    f"{API_PREFIX}/samples/{{sample_code}}/temperature/anomalies/dispositions",
+    tags=["temperature-dispositions"],
+)
+def list_dispositions_api(sample_code: str, status: str | None = None) -> dict[str, Any]:
+    """异常处置台账：该样本全部处置单（含异常已消失的失效记录），可用 ?status= 过滤。
+
+    status 仅接受 active（有效处置）或 invalidated（失效历史），非法值 → 422。
+    每条附提交时证据快照（submitted_evidence）、失效原因/时间及该异常当前是否仍存在、
+    摘要是否一致（current）。查询同样执行惰性对账。
+    """
+    if status is not None and status not in ("active", "invalidated"):
+        return JSONResponse(status_code=422, content={"error": {
+            "code": "invalid_status_filter",
+            "message": "status 仅接受 active 或 invalidated",
+            "details": {"status": status},
+        }})
+    with db_session(immediate=True) as conn:
+        return list_disposition_ledger(conn, sample_code, status)
+
+
+# --------------------------------------------------------------------------- 案卷封存（同一抽检多份样本）
+
+@app.post(f"{API_PREFIX}/dossiers", tags=["dossiers"], status_code=201)
+def submit_dossier_api(data: DossierIn) -> JSONResponse:
+    """同一抽检的多份样本保管链封存为案卷。
+
+    * 至少两份不重复样本；可逐份指定非负历史版本，未指定者取封存事务中的最新版本
+      （整卷选取在同一事务的一致视图中完成）；
+    * 任一样本/版本不存在、编号重复 → 整卷失败且不留案卷；
+    * 案卷永久保存所选版本完整快照与按样本编号排序的清单，并生成可复算 SHA-256 摘要；
+    * 同案卷号同内容重试 → 200 幂等返回原卷（即使最新版本已变化）；异内容 → 409 dossier_conflict；
+    * 并发提交由 BEGIN IMMEDIATE 串行化，遵循已提交结果。
+    """
+    with db_session(immediate=True) as conn:
+        dossier, idempotent = submit_dossier(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"dossier": dossier, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/dossiers/{{dossier_id}}", tags=["dossiers"])
+def get_dossier_api(dossier_id: str) -> dict[str, Any]:
+    """案卷查询：按样本编号排序的清单、各份所选版本完整快照与封存摘要。"""
+    with db_session() as conn:
+        return {"dossier": get_dossier(conn, dossier_id)}
+
+
+@app.post(f"{API_PREFIX}/dossiers/{{dossier_id}}/verify", tags=["dossiers"])
+def verify_dossier_api(dossier_id: str) -> dict[str, Any]:
+    """案卷核验：按封存内容重算 SHA-256 摘要并返回一致与否（只读，不静默改写）。"""
+    with db_session() as conn:
+        return verify_dossier(conn, dossier_id)
+
+
+# --------------------------------------------------------------------------- 案卷双人独立复核
+
+@app.post(f"{API_PREFIX}/dossiers/{{dossier_id}}/reviews", tags=["reviews"], status_code=201)
+def submit_review_api(dossier_id: str, data: ReviewIn) -> JSONResponse:
+    """已封存案卷双人独立复核 / 第三人裁决提交。
+
+    * 提交必须携带案卷封存摘要 expected_digest，与库存摘要不一致拒绝写入；
+    * 前两份由两名不同复核人各提交一次覆盖卷内每份样本的完整清单，意见提交后不可改；
+    * 逐份意见一致即终局，分歧份项仅允许未参与前两次复核的第三人裁决；
+    * 全部份项终局后形成案卷结论，任一份不通过则案卷不通过；
+    * 利益冲突回避：复核人（及其登记别名）命中封存份项的采集/移交/签收/核定参与人
+      → 409 review_recusal 整单拒绝（两人复核按全部份项、第三人裁决按分歧份项检查）；
+    * 复核人互异与第三人资格按本次提交时的人员标识/别名归属判定；
+      成功意见记录当时的人员归属（person_id）供查询；
+    * 同复核单号同内容重试 → 200 幂等返回原结果；异内容 → 409 review_conflict；
+    * 缺项 / 重复份项 / 重复复核人 / 越阶段提交拒绝且不留部分记录；
+    * 并发提交由 BEGIN IMMEDIATE 串行，按已提交状态判定。
+    """
+    with db_session(immediate=True) as conn:
+        body, idempotent = submit_review(conn, dossier_id, data)
+    body["idempotent"] = idempotent
+    return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+@app.get(f"{API_PREFIX}/dossiers/{{dossier_id}}/reviews", tags=["reviews"])
+def get_review_api(dossier_id: str) -> dict[str, Any]:
+    """案卷复核查询：复核进度、原始意见（含提交时人员归属）、分歧对照与终局结论（含逐份状态）。"""
+    with db_session() as conn:
+        return get_review(conn, dossier_id)
+
+
+# --------------------------------------------------------------------------- 人员标识与历史别名（复核回避）
+
+@app.post(f"{API_PREFIX}/persons", tags=["identities"], status_code=201)
+def register_person_api(data: PersonIn) -> JSONResponse:
+    """登记人员标识（主标识 + 可选初始历史别名）。
+
+    * 主标识与全部别名构成全局唯一命名空间：任何名称只归属一人，
+      别名不得归属多人、不得转移归属；
+    * 登记成功后修订号为 1；同主标识同内容（含初始别名集合）重试 → 200 幂等，
+      异内容 → 409 person_conflict；名称已被占用 → 409 alias_conflict。
+    """
+    with db_session(immediate=True) as conn:
+        person, idempotent = register_person(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"person": person, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/persons", tags=["identities"])
+def list_persons_api() -> dict[str, Any]:
+    """全部已登记人员：主标识、当前修订号与全部别名。"""
+    with db_session() as conn:
+        return list_persons(conn)
+
+
+@app.get(f"{API_PREFIX}/persons/{{person_id}}", tags=["identities"])
+def get_person_api(person_id: str) -> dict[str, Any]:
+    """人员查询：主标识、当前修订号（增补别名时须携带）与全部别名。"""
+    with db_session() as conn:
+        return {"person": get_person(conn, person_id)}
+
+
+@app.post(f"{API_PREFIX}/persons/{{person_id}}/aliases", tags=["identities"], status_code=201)
+def add_alias_api(person_id: str, data: AliasIn) -> dict[str, Any]:
+    """增补历史别名：须携带所见修订号（expected_revision）。
+
+    * 与人员当前修订号不一致（过期）→ 409 identity_revision_stale；
+    * 别名已归属任何人（含本人、含任何主标识）→ 409 alias_conflict；
+    * 成功：别名落库且修订号 +1；并发按 BEGIN IMMEDIATE 串行后的已提交修订号判定。
+    """
+    with db_session(immediate=True) as conn:
+        person = add_alias(conn, person_id, data)
+    return {"person": person}
