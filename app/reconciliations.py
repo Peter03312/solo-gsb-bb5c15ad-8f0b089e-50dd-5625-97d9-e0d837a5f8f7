@@ -427,6 +427,17 @@ def submit_batch_reconciliation(
                  req_item.event_id, event_row["id"], req_item.verified_seal_no, None),
             )
 
+    # 提交时失效追踪：收妥项为各样本真正提交的 receive 事件（改变在途/保管归属），
+    # 逐份对账异常处置；异常项不生成事件、不改变保管链，不触发。整单失败在上方已整单
+    # 回滚，同单号同内容重试走幂等分支返回——均不会到达此处。
+    from .dispositions import TRIGGER_CUSTODY_EVENT, invalidate_for_sample
+
+    for _req_item, _batch_item, sample, _eff in accepted_received:
+        invalidate_for_sample(
+            conn, sample, kind=TRIGGER_CUSTODY_EVENT,
+            ref=_req_item.event_id, action="reconciliation_receive",
+        )
+
     return get_batch_reconciliation(conn, batch_id), False
 
 

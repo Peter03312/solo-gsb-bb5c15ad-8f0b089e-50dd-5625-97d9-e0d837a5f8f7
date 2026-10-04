@@ -223,6 +223,13 @@ def create_temp_reading(conn: sqlite3.Connection, data: TempReadingIn) -> tuple[
         )
 
     row = conn.execute("SELECT * FROM temp_reading WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 提交时失效追踪：真正补录的读数可使超温点/缺测区间产生或消失（相邻有证读数重排），
+    # 当即在同一事务对账该样本的有效处置；失败（采集前/重复时刻/无配置/已核定）在上方
+    # 已抛错回滚、同号同内容重试走幂等分支——均不会到达此处。
+    from .dispositions import TRIGGER_READING, invalidate_for_sample
+
+    invalidate_for_sample(conn, sample, kind=TRIGGER_READING,
+                          ref=data.reading_id, action="record_reading")
     return _reading_view(row, sample["sample_code"]), False
 
 

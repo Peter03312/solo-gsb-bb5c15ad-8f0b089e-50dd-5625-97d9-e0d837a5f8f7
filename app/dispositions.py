@@ -18,8 +18,15 @@
   * 同一异常项同一证据摘要只接受一次处置：重复提交 → 409 anomaly_already_disposed；
   * 同处置单号同内容重试 → 200 幂等返回原结果（即使原意见已失效）；异内容（含跨样本
     复用单号）→ 409 disposition_conflict；
-  * 异常项或归属变化后，原处置意见在查询/提交时惰性对账标记为失效（anomaly_gone /
-    evidence_changed），永久可查、不删除不改写；新摘要下可重新处置；
+  * 提交时失效追踪（本轮修复）：每次“真正提交”的读数、校准证明或有效保管链变化
+    （单事件、批量移交、整批对账签收、作废/替换纠错）由写入路径在同一事务内立即调用
+    invalidate_for_sample / invalidate_for_device 对账——异常消失（anomaly_gone）或摘要
+    变化（evidence_changed）的有效处置**当即**标记失效并记录触发变化（invalidated_by），
+    永久留痕、不可改、不复活；之后证据恢复旧值/旧状态，旧处置仍保持失效，当前异常呈现
+    未处置（pending）。失败操作与同内容幂等重试不调用对账，故不会误触发失效；写事务均以
+    BEGIN IMMEDIATE 串行，按提交顺序判定。查询/提交时仍保留惰性 reconcile_dispositions
+    兜底（旧库升级后的存量有效处置、以及理论上遗漏的路径），其失效记录 invalidated_by
+    为 NULL。
   * 处置只写 temp_anomaly_disposition 表：不改动原始读数、校准证明、既有可信复核结论、
     保管链版本与已封存案卷（也不产生保管链版本）。
 """
@@ -41,6 +48,12 @@ STATUS_INVALIDATED = "invalidated"
 
 REASON_GONE = "anomaly_gone"
 REASON_CHANGED = "evidence_changed"
+
+# 失效触发变化类型（invalidated_by.kind）——仅由“真正提交”的写路径在事务内传入：
+TRIGGER_READING = "reading"              # 读数真正提交（单条补录）
+TRIGGER_CALIBRATION = "calibration"      # 校准证明真正补录或作废
+TRIGGER_CUSTODY_EVENT = "custody_event"  # 单事件 / 批量移交 / 整批对账签收
+TRIGGER_CORRECTION = "correction"        # 作废 / 替换纠错
 
 
 # --------------------------------------------------------------------------- 指纹
@@ -242,16 +255,30 @@ def _list_dispositions(conn: sqlite3.Connection, sample_pk: int) -> list[sqlite3
     ).fetchall()
 
 
-def reconcile_dispositions(conn: sqlite3.Connection, sample: sqlite3.Row) -> None:
-    """按当前异常项对账该样本的全部有效处置意见（惰性失效标记）。
+def reconcile_dispositions(
+    conn: sqlite3.Connection,
+    sample: sqlite3.Row,
+    changed_by: dict[str, Any] | None = None,
+) -> None:
+    """按当前异常项对账该样本的全部有效处置意见（失效标记）。
 
     * 当前异常集合中已无该标识 → invalidated / anomaly_gone；
     * 异常仍在但证据摘要变化（归属或证据要素变化）→ invalidated / evidence_changed，
       记录重算后的当前摘要供比对；
     * 已失效记录永久保留，不再复活（即使新证据恰好与旧摘要相同也不回改状态）。
+
+    changed_by 非 None 时为“提交时失效追踪”（由真正提交的写路径在同一事务内调用）：
+    本次新标记失效的记录 invalidated_by 列写入触发变化（kind/ref/action）留痕；为 None
+    时为查询惰性对账兜底，invalidated_by 保持 NULL。
     """
+    if _get_config_row(conn, sample["id"]) is None:
+        # 未设定测温配置：无当前可信异常（提交处置也会 404），存量有效处置不可能存在；
+        # 直接跳过，避免为无配置样本计算可信复核（其本应抛 temp_config_not_found）。
+        return
     current = build_current_anomalies(conn, sample)["anomalies"]
     now = utcnow_iso()
+    changed_json = json.dumps(changed_by, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":")) if changed_by is not None else None
     for row in _list_dispositions(conn, sample["id"]):
         if row["status"] != STATUS_ACTIVE:
             continue
@@ -259,20 +286,73 @@ def reconcile_dispositions(conn: sqlite3.Connection, sample: sqlite3.Row) -> Non
         if cur is None:
             conn.execute(
                 "UPDATE temp_anomaly_disposition SET status = ?, invalidated_at = ?,"
-                " invalidate_reason = ?, current_evidence_digest = NULL WHERE id = ?",
-                (STATUS_INVALIDATED, now, REASON_GONE, row["id"]),
+                " invalidate_reason = ?, current_evidence_digest = NULL, invalidated_by = ?"
+                " WHERE id = ?",
+                (STATUS_INVALIDATED, now, REASON_GONE, changed_json, row["id"]),
             )
         elif cur["evidence_digest"] != row["evidence_digest"]:
             conn.execute(
                 "UPDATE temp_anomaly_disposition SET status = ?, invalidated_at = ?,"
-                " invalidate_reason = ?, current_evidence_digest = ? WHERE id = ?",
-                (STATUS_INVALIDATED, now, REASON_CHANGED, cur["evidence_digest"], row["id"]),
+                " invalidate_reason = ?, current_evidence_digest = ?, invalidated_by = ?"
+                " WHERE id = ?",
+                (STATUS_INVALIDATED, now, REASON_CHANGED, cur["evidence_digest"],
+                 changed_json, row["id"]),
+            )
+
+
+def _sample_ids_with_config(conn: sqlite3.Connection) -> set[int]:
+    return {r["sample_id"] for r in conn.execute(
+        "SELECT sample_id FROM sample_temp_config"
+    ).fetchall()}
+
+
+def invalidate_for_sample(
+    conn: sqlite3.Connection,
+    sample: sqlite3.Row,
+    *,
+    kind: str,
+    ref: str | None,
+    action: str,
+) -> None:
+    """提交时失效追踪（单样本）：一次真正提交的读数/保管链变化/纠错已随本事务落库后调用。
+
+    在同一写事务内按提交后的最终证据对账，把已消失或摘要变化的有效处置当即标记失效，
+    invalidated_by = {"kind", "ref", "action"}。幂等重试与失败路径不调用本函数。
+    """
+    reconcile_dispositions(conn, sample, changed_by={"kind": kind, "ref": ref, "action": action})
+
+
+def invalidate_for_device(
+    conn: sqlite3.Connection,
+    device_id: str,
+    *,
+    ref: str,
+    action: str,
+) -> None:
+    """提交时失效追踪（设备维度）：校准证明真正补录/作废后，对账该设备全部读数所属、
+    且已设定测温配置的样本（一次证明变化可影响多份样本）。与证明写入同一事务提交。
+    """
+    sample_ids = {
+        r["sample_id"] for r in conn.execute(
+            "SELECT DISTINCT tr.sample_id FROM temp_reading tr"
+            " WHERE tr.device_id = ?", (device_id,)
+        ).fetchall()
+    } & _sample_ids_with_config(conn)
+    for sample_id in sorted(sample_ids):
+        sample = conn.execute("SELECT * FROM sample WHERE id = ?", (sample_id,)).fetchone()
+        if sample is not None:
+            invalidate_for_sample(
+                conn, sample, kind=TRIGGER_CALIBRATION, ref=ref, action=action
             )
 
 
 # --------------------------------------------------------------------------- 视图
 
 def _disposition_view(row: sqlite3.Row) -> dict[str, Any]:
+    keys = row.keys()
+    invalidated_by = None
+    if "invalidated_by" in keys and row["invalidated_by"]:
+        invalidated_by = json.loads(row["invalidated_by"])
     return {
         "disposition_no": row["disposition_no"],
         "anomaly_id": row["anomaly_id"],
@@ -286,6 +366,9 @@ def _disposition_view(row: sqlite3.Row) -> dict[str, Any]:
         "invalidated_at": row["invalidated_at"],
         "invalidate_reason": row["invalidate_reason"],
         "current_evidence_digest": row["current_evidence_digest"],
+        # 提交时失效追踪：哪次真正提交的变化导致失效（kind/ref/action）；
+        # NULL = 查询惰性对账标记（存量兜底）。
+        "invalidated_by": invalidated_by,
         "submitted_evidence": json.loads(row["evidence_json"]),
     }
 

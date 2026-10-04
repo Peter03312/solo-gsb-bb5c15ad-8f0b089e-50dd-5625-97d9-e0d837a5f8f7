@@ -149,6 +149,12 @@ def register_calibration(
             )
         raise
     row = conn.execute("SELECT * FROM device_calibration WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 提交时失效追踪：真正补录的证明可使读数由无证变有证（异常产生/消失/证明号变化），
+    # 当即对账该设备全部读数所属样本（同一事务）；失败（无读数设备/时段重叠）在上方已抛错
+    # 回滚、同号同内容重试走幂等分支——均不会到达此处。
+    from .dispositions import invalidate_for_device
+
+    invalidate_for_device(conn, data.device_id, ref=data.certificate_id, action="register")
     return calibration_view(row), False
 
 
@@ -180,6 +186,11 @@ def void_calibration(
         " WHERE id = ? AND voided_at IS NULL",
         (utcnow_iso(), data.reason, h, existing["id"]),
     )
+    # 提交时失效追踪：真正作废使该证明不再覆盖读数（超温点消失/证明号变化），当即对账
+    # 该设备全部读数所属样本（同一事务）；同号同理由重试在上方走幂等分支，不触发。
+    from .dispositions import invalidate_for_device
+
+    invalidate_for_device(conn, existing["device_id"], ref=certificate_id, action="void")
     row = get_certificate_or_404(conn, certificate_id)
     return calibration_view(row), False
 

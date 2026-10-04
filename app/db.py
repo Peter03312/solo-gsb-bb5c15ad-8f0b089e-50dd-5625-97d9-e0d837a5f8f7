@@ -255,10 +255,12 @@ CREATE INDEX IF NOT EXISTS idx_calibration_device_active ON device_calibration(d
 -- 可信测温复核异常处置（运输质控）：质控人对可信测温复核当前仍存在的超温点/缺测区间
 -- 留存处置意见。每条处置记录提交时所见的稳定异常标识、证据摘要指纹与完整证据快照；
 -- 异常项以稳定标识（oor:<读数号> / gap:<前后有证读数号>）追踪，同一异常同一证据摘要
--- 至多一条“有效”处置（部分唯一索引）。读数/证明补录或作废、保管链纠错使异常消失或
--- 摘要变化后，原处置在查询/提交时惰性对账标记为失效（永久可查、不删除、不改写），
--- 新摘要可重新处置。处置只写本表，不改动原始读数、校准证明、测温复核结论、保管链
--- 版本与已封存案卷。
+-- 至多一条“有效”处置（部分唯一索引）。每次“真正提交”的读数、校准证明或有效保管链变化
+-- （单事件、批量移交、整批对账签收、作废/替换纠错）在同一写事务内立即对账：异常消失或
+-- 摘要变化的有效处置当即标记失效（invalidated_by 记录触发变化），永久可查、不删除、
+-- 不改写、不复活——即使证据事后恢复旧值；失败操作与同内容重试不触发。查询仍保留惰性
+-- 对账兜底（invalidated_by 为 NULL）。处置只写本表，不改动原始读数、校准证明、测温复核
+-- 结论、保管链版本与已封存案卷。
 CREATE TABLE IF NOT EXISTS temp_anomaly_disposition (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     disposition_no  TEXT NOT NULL UNIQUE,            -- 全局唯一处置单号（同号同内容幂等/异内容冲突）
@@ -278,6 +280,8 @@ CREATE TABLE IF NOT EXISTS temp_anomaly_disposition (
     invalidate_reason TEXT CHECK (invalidate_reason IS NULL
                     OR invalidate_reason IN ('anomaly_gone','evidence_changed')),
     current_evidence_digest TEXT,                   -- evidence_changed 时重算的当前摘要（其余为 NULL）
+    invalidated_by  TEXT,                           -- 提交时失效追踪：触发失效的已提交变化（JSON：kind/ref/action）；
+                                                    -- NULL 表示查询惰性对账或升级前历史失效
     created_at      TEXT NOT NULL
 );
 
@@ -307,12 +311,17 @@ _MIGRATION_COLUMNS = {
     "review": [
         ("reviewer_person_id", "TEXT"),                # 升级前旧意见保持 NULL，不伪造身份记录
     ],
+    "temp_anomaly_disposition": [
+        # 本轮修复：提交时失效追踪（触发来源留痕）；升级前已存在的处置行补 NULL。
+        ("invalidated_by", "TEXT"),
+    ],
 }
 
 # 启动升级版本号（写入 SQLite user_version，随升级事务一同提交/回滚）：
 # 1 = 建表 + 旧库补列 + 索引 + 版本 0 基线 的整轮原子升级。
-# 已完成的库（user_version >= SCHEMA_VERSION）启动时直接沿用，不重复执行。
-SCHEMA_VERSION = 1
+# 2 = 修复异常处置失效追踪：temp_anomaly_disposition 补 invalidated_by 列
+#     （新库随 SCHEMA 直接建成；user_version=1 的旧库原子补列，不留部分结果）。
+SCHEMA_VERSION = 2
 
 
 def utcnow_iso() -> str:

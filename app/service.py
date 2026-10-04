@@ -211,6 +211,12 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
     from .versions import CHANGE_EVENT, record_version
 
     record_version(conn, sample, CHANGE_EVENT, data.event_id)
+    # 提交时失效追踪：真正提交的保管链事件（移交/签收可改变异常归属、补录读数相邻性则由
+    # 读数路径处理）当即对账异常处置；失败操作与同内容重试在上方已返回/抛错，不会到达此处。
+    from .dispositions import TRIGGER_CUSTODY_EVENT, invalidate_for_sample
+
+    invalidate_for_sample(conn, sample, kind=TRIGGER_CUSTODY_EVENT,
+                          ref=data.event_id, action=data.event_type)
     return row, False
 
 
@@ -565,6 +571,12 @@ def submit_correction(conn: sqlite3.Connection, data: CorrectionIn) -> tuple[dic
     from .versions import CHANGE_CORRECTION, record_version
 
     record_version(conn, sample, CHANGE_CORRECTION, data.correction_id)
+    # 提交时失效追踪：有效保管链变化（作废/替换可改变异常归属或使异常消失）当即对账；
+    # 失败纠错（事件已失效/已核定/冲突）在上方已抛错回滚，不会误触发。
+    from .dispositions import TRIGGER_CORRECTION, invalidate_for_sample
+
+    invalidate_for_sample(conn, sample, kind=TRIGGER_CORRECTION,
+                          ref=data.correction_id, action=data.action)
     return _correction_result(conn, sample, corr_row), False
 
 
@@ -807,6 +819,16 @@ def submit_transfer_batch(conn: sqlite3.Connection, data: TransferBatchIn) -> tu
         from .versions import CHANGE_BATCH, record_version
 
         record_version(conn, srow, CHANGE_BATCH, data.batch_id)
+
+    # 提交时失效追踪：批量移交为批内各样本真正提交的保管链变化，逐份对账异常处置
+    # （整批失败已在上方预校验抛错回滚；同批次号同内容重试走幂等分支返回，不触发）。
+    from .dispositions import TRIGGER_CUSTODY_EVENT, invalidate_for_sample
+
+    for it in data.items:
+        invalidate_for_sample(
+            conn, sample_rows[it.sample_code], kind=TRIGGER_CUSTODY_EVENT,
+            ref=it.event_id, action="batch_transfer",
+        )
 
     return get_transfer_batch(conn, data.batch_id), False
 

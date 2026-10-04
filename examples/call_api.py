@@ -934,6 +934,80 @@ def main() -> None:
     for d in r["items"]:
         print(f"  {d['disposition_no']}: {d['anomaly_id']} {d['decision']} {d['status']}")
 
+    # 19.7) 提交时失效追踪（本轮修复）：补录移交→作废，证据恢复但旧意见永久失效不复活
+    print("\n=== 提交时失效追踪：中间证据变化不漏记 ===")
+    tcode = f"API-TRK-{run_d}"
+    call("POST", "/samples", {
+        "sample_code": tcode, "collected_at": "2026-09-30T01:00:00Z",
+        "collector": dcollector, "seal_no": f"SEAL-TRK-{run_d}",
+    })
+    call("POST", "/temperature-configs", {
+        "sample_code": tcode, "min_celsius": 2.0, "max_celsius": 8.0,
+        "max_interval_seconds": 1800,
+    })
+    call("POST", "/temperature-readings", {
+        "sample_code": tcode, "reading_id": f"API-TRD-1-{run_d}",
+        "device_id": "DEV-TRK-01", "occurred_at": "2026-09-30T02:00:00Z", "value_celsius": 9.5,
+    })
+    call("POST", "/temperature-calibrations", {
+        "certificate_id": f"API-TCAL-1-{run_d}", "device_id": "DEV-TRK-01",
+        "valid_from": "2026-09-30T01:00:00Z", "valid_to": "2026-09-30T06:00:00Z",
+        "issued_by": "计量员甲",
+    })
+    s, r = call("GET", f"/samples/{tcode}/temperature/anomalies")
+    tpoint = next(a for a in r["items"] if a["anomaly_type"] == "out_of_range_point")
+    original_digest = tpoint["evidence_digest"]
+    print(f"超温点 {tpoint['anomaly_id']} 初始归属: {tpoint['attribution']}")
+    s, r = call("POST", f"/samples/{tcode}/temperature/anomalies/dispositions", {
+        "disposition_no": f"API-TNO-1-{run_d}", "sample_code": tcode,
+        "anomaly_id": tpoint["anomaly_id"], "expected_evidence_digest": original_digest,
+        "decision": "acknowledged", "reason": "认可：采集后运输前温控超限", "handler": "质控员赵",
+    })
+    show("提交认可意见（201）", s, r, "disposition", "status")
+
+    # 补录移交（01:30 移交、02:30 签收）→ 02:00 读数归属变为在途，处置应在移交事务内立即失效
+    call("POST", "/events", {
+        "event_id": f"API-TEVT-TX-{run_d}", "event_type": "transfer", "sample_code": tcode,
+        "occurred_at": "2026-09-30T01:30:00Z",
+        "transfer_no": f"TR-TRK-{run_d}", "from_custodian": dcollector, "to_custodian": "李运输",
+    })
+    s, r = call("GET", f"/samples/{tcode}/temperature/anomalies/dispositions?status=invalidated")
+    d0 = r["items"][0]
+    print(f"补录移交后（未先查异常）台账立即呈现失效 [HTTP {s}]: {d0['status']}/"
+          f"{d0['invalidate_reason']} | invalidated_by={d0['invalidated_by']}")
+
+    # 随后作废补录的签收与移交 → 归属与证据摘要恢复原值，但旧意见不复活
+    call("POST", "/events", {
+        "event_id": f"API-TEVT-RX-{run_d}", "event_type": "receive", "sample_code": tcode,
+        "occurred_at": "2026-09-30T02:30:00Z",
+        "transfer_no": f"TR-TRK-{run_d}", "receiver": "李运输",
+        "seal_no": f"SEAL-TRK-{run_d}",
+    })
+    call("POST", "/corrections", {
+        "correction_id": f"API-TFIX-RX-{run_d}", "sample_code": tcode,
+        "target_event_id": f"API-TEVT-RX-{run_d}", "action": "void",
+        "operator": "链管理员", "reason": "撤销补录签收",
+    })
+    call("POST", "/corrections", {
+        "correction_id": f"API-TFIX-TX-{run_d}", "sample_code": tcode,
+        "target_event_id": f"API-TEVT-TX-{run_d}", "action": "void",
+        "operator": "链管理员", "reason": "撤销补录移交",
+    })
+    s, r = call("GET", f"/samples/{tcode}/temperature/anomalies")
+    p_now = next(a for a in r["items"] if a["anomaly_id"] == tpoint["anomaly_id"])
+    print(f"作废后归属恢复: {p_now['attribution']} | 摘要恢复原值="
+          f"{p_now['evidence_digest'] == original_digest}")
+    print(f"但旧意见不复活：当前 disposition_status={p_now['disposition_status']}，"
+          f"失效历史 {len(p_now['invalidated_history'])} 条（仍为 "
+          f"{p_now['invalidated_history'][0]['disposition_no']}）")
+    s, r = call("POST", f"/samples/{tcode}/temperature/anomalies/dispositions", {
+        "disposition_no": f"API-TNO-2-{run_d}", "sample_code": tcode,
+        "anomaly_id": tpoint["anomaly_id"], "expected_evidence_digest": original_digest,
+        "decision": "acknowledged", "reason": "证据恢复后以新单号重新认可", "handler": "质控员赵",
+    })
+    show("恢复后新单号按原摘要重新处置（201）", s, r, "disposition", "status")
+    print("（失败操作与同内容重试不会触发失效；并发写入由 BEGIN IMMEDIATE 按提交顺序判定）")
+
 
 if __name__ == "__main__":
     main()
