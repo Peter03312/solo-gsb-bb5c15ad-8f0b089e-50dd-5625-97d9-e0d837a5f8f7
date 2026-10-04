@@ -427,6 +427,14 @@ def submit_batch_reconciliation(
                  req_item.event_id, event_row["id"], req_item.verified_seal_no, None),
             )
 
+    # 收妥 receive 事件真正落库 → 逐样本同事务对账有效处置意见（归属随签收改变）。
+    # 整单失败在上方已回滚、同单号幂等重试在上方已返回，均不触达此处；异常项不产生
+    # 事件，不影响证据，无需对账。
+    from .dispositions import track_sample_evidence_committed
+
+    for _, _, received_sample, _ in accepted_received:
+        track_sample_evidence_committed(conn, received_sample)
+
     return get_batch_reconciliation(conn, batch_id), False
 
 

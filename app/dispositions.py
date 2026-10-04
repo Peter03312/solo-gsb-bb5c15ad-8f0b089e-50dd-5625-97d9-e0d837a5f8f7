@@ -18,8 +18,15 @@
   * 同一异常项同一证据摘要只接受一次处置：重复提交 → 409 anomaly_already_disposed；
   * 同处置单号同内容重试 → 200 幂等返回原结果（即使原意见已失效）；异内容（含跨样本
     复用单号）→ 409 disposition_conflict；
-  * 异常项或归属变化后，原处置意见在查询/提交时惰性对账标记为失效（anomaly_gone /
-    evidence_changed），永久可查、不删除不改写；新摘要下可重新处置；
+  * 失效追踪以**提交点对账**为准：每次真正提交的读数、校准证明（登记/作废）或有效
+    保管链变化（单事件、批量移交、整批对账收妥、作废/替换纠错）在同一事务内重算
+    受影响样本的当前异常，判定已处置异常是否消失或摘要改变——一旦变化即把旧意见
+    标记失效（anomaly_gone / evidence_changed），永久可查、不删除不改写、**之后证据
+    恢复也不复活**（例如补录移交使归属变为在途后又作废该移交：移交提交时旧意见即已
+    失效，作废后摘要虽恢复原值，旧意见仍保持失效，当前异常展示未处置）；
+    查询/提交时的惰性对账作为兜底保留；新摘要下可重新处置；
+  * 失败操作（整单回滚）与同内容幂等重试不触发失效；并发写入由 BEGIN IMMEDIATE
+    串行化，按提交顺序判定；
   * 处置只写 temp_anomaly_disposition 表：不改动原始读数、校准证明、既有可信复核结论、
     保管链版本与已封存案卷（也不产生保管链版本）。
 """
@@ -233,7 +240,7 @@ def build_current_anomalies(conn: sqlite3.Connection, sample: sqlite3.Row) -> di
     }
 
 
-# --------------------------------------------------------------------------- 失效对账（惰性）
+# --------------------------------------------------------------------------- 失效对账（提交点判定 + 查询兜底）
 
 def _list_dispositions(conn: sqlite3.Connection, sample_pk: int) -> list[sqlite3.Row]:
     return conn.execute(
@@ -243,7 +250,7 @@ def _list_dispositions(conn: sqlite3.Connection, sample_pk: int) -> list[sqlite3
 
 
 def reconcile_dispositions(conn: sqlite3.Connection, sample: sqlite3.Row) -> None:
-    """按当前异常项对账该样本的全部有效处置意见（惰性失效标记）。
+    """按当前异常项对账该样本的全部有效处置意见（提交点调用为主，查询/提交时兜底）。
 
     * 当前异常集合中已无该标识 → invalidated / anomaly_gone；
     * 异常仍在但证据摘要变化（归属或证据要素变化）→ invalidated / evidence_changed，
@@ -268,6 +275,47 @@ def reconcile_dispositions(conn: sqlite3.Connection, sample: sqlite3.Row) -> Non
                 " invalidate_reason = ?, current_evidence_digest = ? WHERE id = ?",
                 (STATUS_INVALIDATED, now, REASON_CHANGED, cur["evidence_digest"], row["id"]),
             )
+
+
+# --------------------------------------------------------------------------- 提交点失效追踪
+
+def _has_active_dispositions(conn: sqlite3.Connection, sample_pk: int) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM temp_anomaly_disposition WHERE sample_id = ? AND status = ? LIMIT 1",
+        (sample_pk, STATUS_ACTIVE),
+    ).fetchone() is not None
+
+
+def track_sample_evidence_committed(conn: sqlite3.Connection, sample: sqlite3.Row) -> None:
+    """一次真正提交的样本级证据变化落库后，在同一事务内对账该样本的有效处置意见。
+
+    调用点（均为真正提交、非幂等重试、非失败回滚）：测温读数、单事件、批量移交中
+    该样本事件、整批对账收妥事件、作废/替换纠错。异常消失或证据摘要变化即把旧意见
+    标为失效（永久留痕、不复活）；证据未变时为零操作。无有效处置或未设定测温配置
+    （不可能存在处置）时零成本跳过，不影响证据写入本身。
+    """
+    if not _has_active_dispositions(conn, sample["id"]):
+        return
+    if _get_config_row(conn, sample["id"]) is None:
+        # 防御：无配置不可能存在处置记录；绝不因对账影响证据写入
+        return
+    reconcile_dispositions(conn, sample)
+
+
+def track_device_evidence_committed(conn: sqlite3.Connection, device_id: str) -> None:
+    """校准证明登记/作废真正落库后，对拥有该设备读数的全部样本逐一对账。
+
+    证明是设备级证据：同一设备可用于多份样本的读数，其覆盖变化可能改变任一样本
+    异常的证据摘要（或使异常退出/进入评估），故按设备扇出到全部相关样本。
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT sample_id FROM temp_reading WHERE device_id = ? ORDER BY sample_id",
+        (device_id,),
+    ).fetchall()
+    for r in rows:
+        sample = conn.execute("SELECT * FROM sample WHERE id = ?", (r["sample_id"],)).fetchone()
+        if sample is not None:
+            track_sample_evidence_committed(conn, sample)
 
 
 # --------------------------------------------------------------------------- 视图
@@ -305,7 +353,8 @@ def _attach_state(view: dict[str, Any], active: sqlite3.Row | None,
 def list_anomaly_view(conn: sqlite3.Connection, sample_code: str) -> dict[str, Any]:
     """按样本查询当前异常项及处置状态（未处置 / 有效处置 / 失效历史三分）。
 
-    提交式对账：查询本身不改动原始证据，但会把已过期的有效处置意见标记为失效
+    失效以提交点对账为准（证据变化提交事务内即判定留痕）；本查询再执行一次兜底对账：
+    查询本身不改动原始证据，只会把仍未被提交点捕获的过期有效处置标记为失效
     （只更新处置表状态，旧意见永久留痕）。
     """
     sample = get_sample_or_404(conn, sample_code)

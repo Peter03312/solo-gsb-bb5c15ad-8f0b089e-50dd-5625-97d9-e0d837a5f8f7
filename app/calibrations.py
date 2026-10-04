@@ -149,6 +149,11 @@ def register_calibration(
             )
         raise
     row = conn.execute("SELECT * FROM device_calibration WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 证明真正落库 → 对拥有该设备读数的全部样本同事务对账处置意见
+    # （覆盖变化可改变异常摘要或使异常进入评估；幂等重试与校验失败不触达此处）
+    from .dispositions import track_device_evidence_committed
+
+    track_device_evidence_committed(conn, data.device_id)
     return calibration_view(row), False
 
 
@@ -180,6 +185,11 @@ def void_calibration(
         " WHERE id = ? AND voided_at IS NULL",
         (utcnow_iso(), data.reason, h, existing["id"]),
     )
+    # 作废真正生效 → 对拥有该设备读数的全部样本同事务对账处置意见
+    # （被覆盖读数退出评估可使异常消失；同理由幂等重试在上方已返回，不触达此处）
+    from .dispositions import track_device_evidence_committed
+
+    track_device_evidence_committed(conn, existing["device_id"])
     row = get_certificate_or_404(conn, certificate_id)
     return calibration_view(row), False
 

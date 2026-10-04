@@ -934,6 +934,73 @@ def main() -> None:
     for d in r["items"]:
         print(f"  {d['disposition_no']}: {d['anomaly_id']} {d['decision']} {d['status']}")
 
+    # 19.7) 失效追踪（提交点对账）：补录移交→作废（摘要往返），旧意见不复活
+    print("\n=== 失效追踪：两次查询间证据摘要往返，旧意见永久失效不复活 ===")
+    run_t = uuid.uuid4().hex[:8]
+    tcode = f"API-TRK-{run_t}"
+    tcollector = f"王采集-{run_t}"
+    call("POST", "/samples", {
+        "sample_code": tcode, "collected_at": "2026-09-30T01:00:00Z",
+        "collector": tcollector, "seal_no": f"SEAL-TRK-{run_t}",
+    })
+    call("POST", "/temperature-configs", {
+        "sample_code": tcode, "min_celsius": 2.0, "max_celsius": 8.0, "max_interval_seconds": 1800,
+    })
+    call("POST", "/temperature-readings", {
+        "sample_code": tcode, "reading_id": f"API-TRD-1-{run_t}",
+        "device_id": f"DEV-TRK-{run_t}", "occurred_at": "2026-09-30T03:00:00Z",
+        "value_celsius": 9.4,
+    })
+    call("POST", "/temperature-calibrations", {
+        "certificate_id": f"API-TCAL-1-{run_t}", "device_id": f"DEV-TRK-{run_t}",
+        "valid_from": "2026-09-30T01:00:00Z", "valid_to": "2026-09-30T06:00:00Z",
+        "issued_by": "计量员甲",
+    })
+    s, r = call("GET", f"/samples/{tcode}/temperature/anomalies")
+    trk = r["items"][0]
+    print(f"异常 {trk['anomaly_id']} 归属={trk['attribution']['kind']}"
+          f" 摘要={trk['evidence_digest'][:12]}…")
+    s, r = call("POST", f"/samples/{tcode}/temperature/anomalies/dispositions", {
+        "disposition_no": f"API-TRK-NO-1-{run_t}",
+        "sample_code": tcode,
+        "anomaly_id": trk["anomaly_id"],
+        "expected_evidence_digest": trk["evidence_digest"],
+        "decision": "acknowledged", "reason": "认可超温", "handler": "质控员赵",
+    })
+    show("提交认可意见（201）", s, r, "disposition", "status")
+    digest_at_submit = trk["evidence_digest"]
+
+    # 两次处置查询之间：补录移交（归属→在途，摘要变化），随后作废该移交（摘要恢复原值）
+    call("POST", "/events", {
+        "event_id": f"API-TEVT-T1-{run_t}", "event_type": "transfer", "sample_code": tcode,
+        "occurred_at": "2026-09-30T02:30:00Z",
+        "transfer_no": f"TR-TRK-{run_t}", "from_custodian": tcollector, "to_custodian": "李运输",
+    })
+    call("POST", "/corrections", {
+        "correction_id": f"API-TFIX-1-{run_t}", "sample_code": tcode,
+        "target_event_id": f"API-TEVT-T1-{run_t}", "action": "void",
+        "operator": "链管理员", "reason": "移交单误录，作废",
+    })
+
+    s, r = call("GET", f"/samples/{tcode}/temperature/anomalies")
+    trk2 = next(a for a in r["items"] if a["anomaly_id"] == trk["anomaly_id"])
+    print(f"摘要已恢复原值: {trk2['evidence_digest'] == digest_at_submit}"
+          f" | 当前处置状态: {trk2['disposition_status']}（未处置）"
+          f" | 失效历史: {[h['disposition_no'] for h in trk2['invalidated_history']]}")
+    hist = trk2["invalidated_history"][0]
+    print(f"  失效留痕: {hist['disposition_no']} {hist['status']}"
+          f" 原因={hist['invalidate_reason']} 失效时间={hist['invalidated_at']}")
+
+    # 摘要恢复后可用新单号重新处置；旧意见永不复活
+    s, r = call("POST", f"/samples/{tcode}/temperature/anomalies/dispositions", {
+        "disposition_no": f"API-TRK-NO-2-{run_t}",
+        "sample_code": tcode,
+        "anomaly_id": trk["anomaly_id"],
+        "expected_evidence_digest": trk2["evidence_digest"],
+        "decision": "acknowledged", "reason": "证据恢复后重新认可", "handler": "质控员赵",
+    })
+    show("恢复原摘要后以新单号重新处置（201）", s, r, "disposition", "status")
+
 
 if __name__ == "__main__":
     main()

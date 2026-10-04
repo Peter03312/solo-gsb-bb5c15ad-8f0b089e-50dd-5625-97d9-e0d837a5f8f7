@@ -211,6 +211,11 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
     from .versions import CHANGE_EVENT, record_version
 
     record_version(conn, sample, CHANGE_EVENT, data.event_id)
+    # 真正提交的事件可能改变有效保管链归属 → 同事务对账该样本的有效处置意见
+    # （失效留痕、不复活；幂等重试与失败回滚不触达此处）
+    from .dispositions import track_sample_evidence_committed
+
+    track_sample_evidence_committed(conn, sample)
     return row, False
 
 
@@ -565,6 +570,10 @@ def submit_correction(conn: sqlite3.Connection, data: CorrectionIn) -> tuple[dic
     from .versions import CHANGE_CORRECTION, record_version
 
     record_version(conn, sample, CHANGE_CORRECTION, data.correction_id)
+    # 有效保管链已变化 → 同事务对账该样本的有效处置意见（归属/摘要变化即失效留痕）
+    from .dispositions import track_sample_evidence_committed
+
+    track_sample_evidence_committed(conn, sample)
     return _correction_result(conn, sample, corr_row), False
 
 
@@ -807,6 +816,13 @@ def submit_transfer_batch(conn: sqlite3.Connection, data: TransferBatchIn) -> tu
         from .versions import CHANGE_BATCH, record_version
 
         record_version(conn, srow, CHANGE_BATCH, data.batch_id)
+
+    # 批量移交真正落库 → 逐样本同事务对账有效处置意见（归属可能随在途移交改变）。
+    # 整批失败在上方已回滚、同号幂等重试在上方已返回，均不触达此处。
+    from .dispositions import track_sample_evidence_committed
+
+    for srow in sample_rows.values():
+        track_sample_evidence_committed(conn, srow)
 
     return get_transfer_batch(conn, data.batch_id), False
 

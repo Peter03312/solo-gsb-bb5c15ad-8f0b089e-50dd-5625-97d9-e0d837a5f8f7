@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="样本交接链核验服务",
     description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核、人员标识复核回避、运输测温证据复核与设备校准可信复核",
-    version="1.11.0",
+    version="1.12.0",
     lifespan=lifespan,
 )
 
@@ -443,8 +443,11 @@ def list_anomalies_api(sample_code: str) -> dict[str, Any]:
     相关读数及校准证明、依当前有效保管链重算的归属（归属待核时 attribution_pending=true，
     不臆定责任人），以及处置状态：未处置（disposition_status=pending）、有效处置
     （active，附有效处置单）、失效历史（invalidated_history，旧意见永久可查）。
-    查询会惰性对账：异常消失或摘要变化的有效处置被标记为失效（只更新处置表状态，
-    不改原始读数、证明、可信复核结论、保管链版本与封存案卷）。未设定测温配置 → 404。
+    失效追踪以提交点对账为准：每次真正提交的读数、校准证明登记/作废或有效保管链
+    变化（单事件、批量移交、整批对账收妥、纠错）在提交事务内即判定——异常消失或
+    摘要改变的旧意见立即永久失效留痕，之后证据恢复也不复活；本查询再执行兜底对账
+    （只更新处置表状态，不改原始读数、证明、可信复核结论、保管链版本与封存案卷）。
+    未设定测温配置 → 404。
     """
     with db_session(immediate=True) as conn:
         return list_anomaly_view(conn, sample_code)
@@ -462,8 +465,9 @@ def submit_disposition_api(sample_code: str, data: AnomalyDispositionIn) -> JSON
     * 同一异常项同一证据摘要只接受一次处置：重复提交 → 409 anomaly_already_disposed；
     * 同处置单号同内容重试 → 200 幂等返回原结果（即使原意见其后已失效）；
       异内容（含跨样本复用单号）→ 409 disposition_conflict；
-    * 读数补录、证明补录/作废、保管链纠错使异常或归属变化后，旧意见在对账时标为失效
-      （永久可查），新摘要下可重新处置；本接口不改变原始证据、可信复核、保管链版本及封存案卷。
+    * 读数补录、证明补录/作废、保管链事件（单事件/批量移交/整批对账收妥）与纠错
+      使异常或归属变化时，旧意见在变化提交的事务内即标为失效（永久可查、不复活），
+      新摘要下可重新处置；本接口不改变原始证据、可信复核、保管链版本及封存案卷。
     """
     with db_session(immediate=True) as conn:
         body, idempotent = submit_disposition(conn, sample_code, data)
@@ -480,7 +484,8 @@ def list_dispositions_api(sample_code: str, status: str | None = None) -> dict[s
 
     status 仅接受 active（有效处置）或 invalidated（失效历史），非法值 → 422。
     每条附提交时证据快照（submitted_evidence）、失效原因/时间及该异常当前是否仍存在、
-    摘要是否一致（current）。查询同样执行惰性对账。
+    摘要是否一致（current）。失效以提交点对账为准（证据变化提交时即留痕），
+    本查询同样执行兜底对账。
     """
     if status is not None and status not in ("active", "invalidated"):
         return JSONResponse(status_code=422, content={"error": {

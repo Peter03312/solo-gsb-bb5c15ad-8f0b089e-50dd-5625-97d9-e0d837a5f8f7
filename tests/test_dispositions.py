@@ -507,6 +507,248 @@ check("失效后同单重试 200 且返回失效状态",
       and r.json()["disposition"]["status"] == "invalidated"
       and r.json()["disposition"]["invalidate_reason"] == "anomaly_gone", r.text)
 
+# ---------------------------------------------------------------- 14. 提交点失效追踪：单事件补录→作废（摘要往返不复活）
+print("14) 补录移交使归属变为在途、随后作废（摘要恢复原值）：旧意见永久失效不复活")
+reg("DISP-8")
+cfg("DISP-8")
+rd("DISP-8", "D8-RD-1", "2026-09-30T03:00:00Z", 9.0, "DEV-D-8")
+cert("D8-C1", "DEV-D-8", "2026-09-30T01:00:00Z", "2026-09-30T06:00:00Z")
+v = anomalies("DISP-8").json()
+pid8 = "oor:D8-RD-1"
+d1 = anomaly_of(v, pid8)["evidence_digest"]
+check("无事件时归属为采集人",
+      anomaly_of(v, pid8)["attribution"] == {"kind": "custodian", "custodian": "王采集"}, str(v))
+r = dispose("DISP-8", "DISP-NO-D8-1", pid8, d1, reason="认可超温", handler="质控员赵")
+check("处置成功 201", r.status_code == 201, r.text)
+
+# 两次处置查询之间：补录移交（归属变为在途，摘要变为 D2），随后作废该移交（摘要恢复 D1）
+r = ev("D8-EVT-T1", "transfer", "DISP-8", "2026-09-30T02:30:00Z",
+       transfer_no="D8-TR-1", from_custodian="王采集", to_custodian="李运输")
+check("补录移交成功", r.status_code == 201, r.text)
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "D8-FIX-1", "sample_code": "DISP-8", "target_event_id": "D8-EVT-T1",
+    "action": "void", "operator": "链管理员", "reason": "移交单误录，作废"})
+check("作废移交成功", r.status_code == 201, r.text)
+
+v = anomalies("DISP-8").json()
+p8 = anomaly_of(v, pid8)
+check("证据摘要已恢复原值", p8["evidence_digest"] == d1, str(p8))
+check("旧意见仍永久失效（不复活），当前异常展示未处置",
+      p8["disposition_status"] == "pending" and p8["disposition"] is None
+      and len(p8["invalidated_history"]) == 1
+      and p8["invalidated_history"][0]["disposition_no"] == "DISP-NO-D8-1"
+      and p8["invalidated_history"][0]["invalidate_reason"] == "evidence_changed", str(p8))
+check("失效留痕记录的当前摘要是在途期间的摘要（≠提交与恢复后的摘要）",
+      p8["invalidated_history"][0]["current_evidence_digest"] is not None
+      and p8["invalidated_history"][0]["current_evidence_digest"] != d1, str(p8))
+lg = ledger("DISP-8").json()
+check("台账：失效留痕且当前摘要虽一致也不复活",
+      lg["items"][0]["status"] == "invalidated"
+      and lg["items"][0]["current"]["present"] is True
+      and lg["items"][0]["current"]["digest_matches"] is True, str(lg))
+r = dispose("DISP-8", "DISP-NO-D8-2", pid8, d1, reason="证据恢复后重新认可", handler="质控员赵")
+check("恢复原摘要后可用新单号重新处置 201", r.status_code == 201, r.text)
+v = anomalies("DISP-8").json()
+p8 = anomaly_of(v, pid8)
+check("重新处置后：新意见有效 + 旧意见仍在失效历史",
+      p8["disposition_status"] == "active"
+      and p8["disposition"]["disposition_no"] == "DISP-NO-D8-2"
+      and len(p8["invalidated_history"]) == 1
+      and p8["invalidated_history"][0]["disposition_no"] == "DISP-NO-D8-1", str(p8))
+
+# ---------------------------------------------------------------- 15. 批量移交补录→作废批内事件（摘要往返不复活）
+print("15) 批量移交补录→作废批内移交事件：提交点失效追踪（摘要往返不复活）")
+reg("DISP-9")
+cfg("DISP-9")
+rd("DISP-9", "D9-RD-1", "2026-09-30T03:00:00Z", 9.0, "DEV-D-9")
+cert("D9-C1", "DEV-D-9", "2026-09-30T01:00:00Z", "2026-09-30T06:00:00Z")
+d1 = anomalies("DISP-9").json()["items"][0]["evidence_digest"]
+r = dispose("DISP-9", "DISP-NO-D9-1", "oor:D9-RD-1", d1, reason="认可", handler="质控员赵")
+check("处置成功 201", r.status_code == 201, r.text)
+r = client.post(f"{API}/transfer-batches", json={
+    "batch_id": "D9-BATCH-1", "occurred_at": "2026-09-30T02:30:00Z",
+    "from_custodian": "王采集", "to_custodian": "李运输",
+    "items": [{"sample_code": "DISP-9", "transfer_no": "D9-TR-1", "event_id": "D9-EVT-B1"}]})
+check("批量移交成功 201", r.status_code == 201, r.text)
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "D9-FIX-1", "sample_code": "DISP-9", "target_event_id": "D9-EVT-B1",
+    "action": "void", "operator": "链管理员", "reason": "批次误录，作废该份移交"})
+check("作废批内移交成功", r.status_code == 201, r.text)
+v = anomalies("DISP-9").json()
+p9 = anomaly_of(v, "oor:D9-RD-1")
+check("摘要恢复原值但旧意见不复活：未处置 + 失效历史",
+      p9["evidence_digest"] == d1
+      and p9["disposition_status"] == "pending"
+      and len(p9["invalidated_history"]) == 1
+      and p9["invalidated_history"][0]["invalidate_reason"] == "evidence_changed", str(p9))
+
+# ---------------------------------------------------------------- 16. 整批对账签收→作废收妥事件（摘要往返不复活）
+print("16) 整批对账签收改变归属→作废收妥事件：提交点失效追踪（摘要往返不复活）")
+reg("DISP-10")
+cfg("DISP-10")
+client.post(f"{API}/transfer-batches", json={
+    "batch_id": "D10-BATCH-1", "occurred_at": "2026-09-30T02:30:00Z",
+    "from_custodian": "王采集", "to_custodian": "李运输",
+    "items": [{"sample_code": "DISP-10", "transfer_no": "D10-TR-1", "event_id": "D10-EVT-B1"}]})
+rd("DISP-10", "D10-RD-1", "2026-09-30T05:00:00Z", 9.0, "DEV-D-10")
+cert("D10-C1", "DEV-D-10", "2026-09-30T01:00:00Z", "2026-09-30T08:00:00Z")
+v = anomalies("DISP-10").json()
+p10 = anomaly_of(v, "oor:D10-RD-1")
+check("读数在途归属", p10["attribution"]["kind"] == "in_transit", str(p10))
+d2 = p10["evidence_digest"]
+r = dispose("DISP-10", "DISP-NO-D10-1", "oor:D10-RD-1", d2, reason="认可在途超温", handler="质控员赵")
+check("处置成功 201", r.status_code == 201, r.text)
+# 整批对账签收：读数归属 在途 → 李运输（摘要变为 D3）
+r = client.post(f"{API}/transfer-batches/D10-BATCH-1/reconciliation", json={
+    "reconciliation_no": "D10-REC-1", "receiver": "李运输", "occurred_at": "2026-09-30T04:30:00Z",
+    "items": [{"sample_code": "DISP-10", "event_id": "D10-EVT-REC1", "verified_seal_no": "SEAL-D"}]})
+check("整批对账签收成功 201", r.status_code == 201, r.text)
+# 作废收妥事件：摘要恢复在途 D2
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "D10-FIX-1", "sample_code": "DISP-10", "target_event_id": "D10-EVT-REC1",
+    "action": "void", "operator": "链管理员", "reason": "签收误录，作废"})
+check("作废收妥事件成功", r.status_code == 201, r.text)
+v = anomalies("DISP-10").json()
+p10 = anomaly_of(v, "oor:D10-RD-1")
+check("摘要恢复在途原值但旧意见不复活",
+      p10["evidence_digest"] == d2
+      and p10["disposition_status"] == "pending"
+      and len(p10["invalidated_history"]) == 1
+      and p10["invalidated_history"][0]["invalidate_reason"] == "evidence_changed"
+      and p10["invalidated_history"][0]["current_evidence_digest"] is not None
+      and p10["invalidated_history"][0]["current_evidence_digest"] != d2, str(p10))
+
+# ---------------------------------------------------------------- 17. 校准证明按设备扇出：共享设备两份样本同时失效
+print("17) 证明作废按设备扇出：共享设备的两份样本处置同时失效，补证后不复活")
+reg("DISP-11")
+reg("DISP-12")
+cfg("DISP-11")
+cfg("DISP-12")
+rd("DISP-11", "D11-RD-1", "2026-09-30T03:00:00Z", 9.0, "DEV-SHARED-1")
+rd("DISP-12", "D12-RD-1", "2026-09-30T03:10:00Z", 10.0, "DEV-SHARED-1")
+cert("DSH-C1", "DEV-SHARED-1", "2026-09-30T01:00:00Z", "2026-09-30T06:00:00Z")
+for code, rid, no in [("DISP-11", "D11-RD-1", "DISP-NO-D11-1"),
+                      ("DISP-12", "D12-RD-1", "DISP-NO-D12-1")]:
+    dig = anomalies(code).json()["items"][0]["evidence_digest"]
+    r = dispose(code, no, f"oor:{rid}", dig, reason="认可", handler="质控员赵")
+    check(f"{code} 处置成功 201", r.status_code == 201, r.text)
+void("DSH-C1", "共享设备证明复核作废")
+for code in ("DISP-11", "DISP-12"):
+    lg = ledger(code).json()
+    check(f"{code} 处置随证明作废即失效（anomaly_gone）",
+          lg["total"] == 1 and lg["items"][0]["status"] == "invalidated"
+          and lg["items"][0]["invalidate_reason"] == "anomaly_gone", str(lg))
+cert("DSH-C2", "DEV-SHARED-1", "2026-09-30T01:00:00Z", "2026-09-30T06:00:00Z", issuer="计量员乙")
+for code in ("DISP-11", "DISP-12"):
+    v = anomalies(code).json()
+    check(f"{code} 补证后异常重现且旧意见不复活",
+          v["total"] == 1 and v["items"][0]["disposition_status"] == "pending"
+          and len(v["items"][0]["invalidated_history"]) == 1, str(v))
+
+# ---------------------------------------------------------------- 18. 失败操作与同内容重试不触发失效
+print("18) 失败操作与同内容重试不触发失效；其后的真实变化仍正常失效")
+reg("DISP-13")
+cfg("DISP-13")
+rd("DISP-13", "D13-RD-1", "2026-09-30T03:00:00Z", 9.0, "DEV-D-13")
+cert("D13-C1", "DEV-D-13", "2026-09-30T01:00:00Z", "2026-09-30T06:00:00Z")
+d1 = anomalies("DISP-13").json()["items"][0]["evidence_digest"]
+dispose("DISP-13", "DISP-NO-D13-1", "oor:D13-RD-1", d1, reason="认可", handler="质控员赵")
+
+
+def still_active(tag):
+    v = anomalies("DISP-13").json()
+    p = anomaly_of(v, "oor:D13-RD-1")
+    check(f"{tag}后旧意见仍有效",
+          p["disposition_status"] == "active"
+          and p["disposition"]["disposition_no"] == "DISP-NO-D13-1"
+          and p["invalidated_history"] == [], str(p))
+
+
+# 同内容幂等重试：读数 / 证明 / 配置
+rd("DISP-13", "D13-RD-1", "2026-09-30T03:00:00Z", 9.0, "DEV-D-13")
+cert("D13-C1", "DEV-D-13", "2026-09-30T01:00:00Z", "2026-09-30T06:00:00Z")
+cfg("DISP-13")
+still_active("同内容重试（读数/证明/配置）")
+
+# 失败操作：未知事件纠错 / 重叠证明 / 事件号占用整批失败 / 未知批次对账 / 未知证明作废 / 过期处置
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "D13-FIX-X", "sample_code": "DISP-13", "target_event_id": "NO-SUCH-EVT",
+    "action": "void", "operator": "链管理员", "reason": "目标不存在"})
+check("未知事件纠错 404 不留记录", r.status_code == 404
+      and r.json()["error"]["code"] == "event_not_found", r.text)
+r = cert("D13-C2", "DEV-D-13", "2026-09-30T02:00:00Z", "2026-09-30T05:00:00Z")
+check("重叠证明 409 不留记录", r.status_code == 409
+      and r.json()["error"]["code"] == "calibration_overlap", r.text)
+r = client.post(f"{API}/transfer-batches", json={
+    "batch_id": "D13-BATCH-X", "occurred_at": "2026-09-30T02:30:00Z",
+    "from_custodian": "王采集", "to_custodian": "李运输",
+    "items": [{"sample_code": "DISP-13", "transfer_no": "D13-TR-X", "event_id": "D8-EVT-T1"}]})
+check("事件号占用整批失败 409 不留记录", r.status_code == 409
+      and r.json()["error"]["code"] == "batch_rejected", r.text)
+r = client.post(f"{API}/transfer-batches/NO-SUCH-BATCH/reconciliation", json={
+    "reconciliation_no": "D13-REC-X", "receiver": "李运输", "occurred_at": "2026-09-30T04:30:00Z",
+    "items": [{"sample_code": "DISP-13", "reason": "批次不存在"}]})
+check("未知批次对账 404 不留记录", r.status_code == 404
+      and r.json()["error"]["code"] == "batch_not_found", r.text)
+r = void("NO-SUCH-CERT", "未知证明")
+check("未知证明作废 404", r.status_code == 404, r.text)
+r = dispose("DISP-13", "DISP-NO-D13-STALE", "oor:D13-RD-1", "b" * 64,
+            reason="过期摘要", handler="质控员赵")
+check("过期摘要处置 422 不留记录", r.status_code == 422
+      and r.json()["error"]["code"] == "anomaly_stale", r.text)
+still_active("各类失败操作")
+
+# 真实变化（补录移交）仍使旧意见正常失效
+ev("D13-EVT-T1", "transfer", "DISP-13", "2026-09-30T02:30:00Z",
+   transfer_no="D13-TR-1", from_custodian="王采集", to_custodian="李运输")
+v = anomalies("DISP-13").json()
+p13 = anomaly_of(v, "oor:D13-RD-1")
+check("真实证据变化后旧意见失效（evidence_changed）",
+      p13["disposition_status"] == "pending" and len(p13["invalidated_history"]) == 1
+      and p13["invalidated_history"][0]["invalidate_reason"] == "evidence_changed", str(p13))
+
+# ---------------------------------------------------------------- 19. 并发：证据写入与处置提交按提交顺序判定
+print("19) 并发：证据写入与处置提交按提交顺序判定（两种合法结局，均无陈旧有效意见）")
+reg("DISP-14")
+cfg("DISP-14")
+rd("DISP-14", "D14-RD-1", "2026-09-30T03:00:00Z", 9.0, "DEV-D-14")
+cert("D14-C1", "DEV-D-14", "2026-09-30T01:00:00Z", "2026-09-30T06:00:00Z")
+dig14 = anomalies("DISP-14").json()["items"][0]["evidence_digest"]
+results.clear()
+barrier = threading.Barrier(2)
+
+
+def post_event():
+    barrier.wait()
+    results["event"] = ev("D14-EVT-T1", "transfer", "DISP-14", "2026-09-30T02:30:00Z",
+                          transfer_no="D14-TR-1", from_custodian="王采集",
+                          to_custodian="李运输").status_code
+
+
+def post_disp():
+    barrier.wait()
+    results["disp"] = dispose("DISP-14", "DISP-NO-D14-1", "oor:D14-RD-1", dig14,
+                              reason="并发处置", handler="质控员赵").status_code
+
+
+t1 = threading.Thread(target=post_event)
+t2 = threading.Thread(target=post_disp)
+t1.start(); t2.start(); t1.join(); t2.join()
+check("事件写入 201；处置 201（先提交）或 422（后提交被判过期）",
+      results["event"] == 201 and results["disp"] in (201, 422), str(results))
+v = anomalies("DISP-14").json()
+p14 = anomaly_of(v, "oor:D14-RD-1")
+if results["disp"] == 201:
+    check("处置先提交：移交提交时已将其判失效，当前未处置",
+          p14["disposition_status"] == "pending"
+          and len(p14["invalidated_history"]) == 1
+          and p14["invalidated_history"][0]["invalidate_reason"] == "evidence_changed", str(p14))
+else:
+    check("移交先提交：处置 422 anomaly_stale 且不留记录，当前未处置",
+          p14["disposition_status"] == "pending" and p14["invalidated_history"] == []
+          and ledger("DISP-14").json()["total"] == 0, str(p14))
+check("无论次序均无陈旧有效意见", v["active_count"] == 0, str(v))
+
 check("健康检查可用", client.get("/health").json()["status"] == "ok")
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")

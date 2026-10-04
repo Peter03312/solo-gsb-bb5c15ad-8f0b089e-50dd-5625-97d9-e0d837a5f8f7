@@ -223,6 +223,11 @@ def create_temp_reading(conn: sqlite3.Connection, data: TempReadingIn) -> tuple[
         )
 
     row = conn.execute("SELECT * FROM temp_reading WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 新读数真正落库 → 同事务对账该样本的有效处置意见（可拆分缺测区间/改变超温点；
+    # 幂等重试与冲突失败在上方已返回或抛错，不触达此处）
+    from .dispositions import track_sample_evidence_committed
+
+    track_sample_evidence_committed(conn, sample)
     return _reading_view(row, sample["sample_code"]), False
 
 
